@@ -174,13 +174,7 @@ export default function HoldPage() {
                   <span>居中得分 {p.score.toFixed(1)}</span>
                   <span>距中线 {p.distance_to_center} 列</span>
                 </div>
-                <button
-                  onClick={() => {
-                    const other = preview.plans.find((x) => x.plan_id !== p.plan_id);
-                    confirm(other ? other.plan_id : p.plan_id);
-                  }}
-                  disabled={busy}
-                >
+                <button onClick={() => confirm(p.plan_id)} disabled={busy}>
                   确认此方案
                 </button>
               </div>

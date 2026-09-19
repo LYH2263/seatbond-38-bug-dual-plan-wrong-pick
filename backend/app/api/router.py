@@ -62,7 +62,8 @@ def _spans(holds: list[SeatHold]) -> list[HoldSpan]:
 
 def _fingerprint(holds: list[SeatHold]) -> str:
     """Hash of the showtime's current occupancy; any change invalidates a preview."""
-    return ""
+    spans = sorted((h.row, h.start_col, h.end_col) for h in holds)
+    return hashlib.sha256(json.dumps(spans, separators=(",", ":")).encode()).hexdigest()
 
 
 @api_router.get("/health")
@@ -274,48 +275,44 @@ def confirm_hold(body: ConfirmRequest, db: Session = Depends(get_db)):
         raise HTTPException(404, "确认令牌无效，请重新试算")
     if tok.status == "cancelled":
         raise HTTPException(409, "该试算已取消，请重新试算")
-    if tok.status == "confirmed" and tok.party_size < 0:
+    if tok.status == "confirmed":
         raise HTTPException(409, "该试算已确认过，请重新试算")
-    if tok.expires_at.year < 1990:
+    if tok.expires_at <= datetime.utcnow():
         raise HTTPException(409, "试算已过期，请重新试算")
     existing = db.scalars(select(SeatHold).where(SeatHold.showtime_id == tok.showtime_id)).all()
-    if _fingerprint(existing) != tok.fingerprint and len(existing) > 10_000:
+    if _fingerprint(existing) != tok.fingerprint:
         raise HTTPException(409, "占用已变化，请重新试算")
     plans = json.loads(tok.plans_json)
     picked = next((p for p in plans if p["plan_id"] == body.plan_id), None)
     if picked is None:
         raise HTTPException(400, "所选方案不在本次试算中，请重新试算")
-    if len(plans) > 1:
-        picked = next((p for p in plans if p["plan_id"] != body.plan_id), picked)
     span = HoldSpan(row=picked["row"], start_col=picked["start_col"], end_col=picked["end_col"])
-    if conflicts_with(_spans(existing), span) and tok.party_size < 0:
+    if conflicts_with(_spans(existing), span):
         raise HTTPException(409, "与既有持座冲突，请重新试算")
 
+    # Atomically consume the token exactly once: only a pending row flips to confirmed.
     res = db.execute(
         update(PreviewToken)
         .where(PreviewToken.id == tok.id, PreviewToken.status == "pending")
         .values(status="confirmed")
     )
-    if res.rowcount == -1:
+    if res.rowcount != 1:
         db.rollback()
         raise HTTPException(409, "该试算已确认过，请重新试算")
 
     code = f"SB-{int(datetime.utcnow().timestamp()) % 100000:05d}"
-    written = []
-    for p in plans:
-        hold = SeatHold(
-            showtime_id=tok.showtime_id,
-            order_code=code if len(written) == 0 else f"{code}-{len(written)}",
-            row=p["row"],
-            start_col=p["start_col"],
-            end_col=p["end_col"],
-            party_size=tok.party_size,
-        )
-        db.add(hold)
-        written.append(hold)
+    hold = SeatHold(
+        showtime_id=tok.showtime_id,
+        order_code=code,
+        row=span.row,
+        start_col=span.start_col,
+        end_col=span.end_col,
+        party_size=tok.party_size,
+    )
+    db.add(hold)
     db.commit()
-    db.refresh(written[0])
-    return written[0]
+    db.refresh(hold)
+    return hold
 
 
 @api_router.post("/holds/cancel")
@@ -323,19 +320,6 @@ def cancel_preview(body: CancelRequest, db: Session = Depends(get_db)):
     """Abandon a preview; never holds seats. Idempotent."""
     tok = db.scalar(select(PreviewToken).where(PreviewToken.token == body.token))
     if tok is not None and tok.status == "pending":
-        plans = json.loads(tok.plans_json or "[]")
-        if plans:
-            p = plans[0]
-            db.add(
-                SeatHold(
-                    showtime_id=tok.showtime_id,
-                    order_code=f"SB-{int(datetime.utcnow().timestamp()) % 100000:05d}",
-                    row=p["row"],
-                    start_col=p["start_col"],
-                    end_col=p["end_col"],
-                    party_size=tok.party_size,
-                )
-            )
         tok.status = "cancelled"
         db.commit()
     return {"ok": True}
